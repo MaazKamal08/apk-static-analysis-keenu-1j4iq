@@ -1,0 +1,541 @@
+{
+  "name": "Farhad - AppSec Static Analysis",
+  "nodes": [
+    {
+      "parameters": {
+        "command": "BASE_DIR=\"/tmp/apk_analysis_keenu\"\nREPORT_DIR=\"$BASE_DIR/report\"\nTEMP_EXTRACT=\"$BASE_DIR/temp_unzip\"\nAPK_DIR=\"$BASE_DIR/apk\"\n\n# ---- Step 1: APK file locate karein (/apk/ folder only) ----\nAPK_FILE=$(ls -t \"$APK_DIR\"/*.xapk \"$APK_DIR\"/*.apk 2>/dev/null | head -n 1)\n\nif [ -z \"$APK_FILE\" ]; then\n    echo \"ERROR: No APK/XAPK found in $APK_DIR\"\n    echo \"Files in BASE_DIR:\"; ls -la \"$BASE_DIR/\" 2>/dev/null || true\n    echo \"Files in APK_DIR:\"; ls -la \"$APK_DIR/\" 2>/dev/null || true\n    exit 1\nfi\necho \"Using APK: $APK_FILE\"\n\n# ---- Step 2: Old report clean karein (Docker root se) ----\ndocker run --rm -v \"$BASE_DIR\":/workspace alpine sh -c \"rm -rf /workspace/report /workspace/temp_unzip\"\n\n# ---- Step 3: Fresh directories banayein ----\nmkdir -p \"$REPORT_DIR\" \"$TEMP_EXTRACT\"\nchmod 777 \"$REPORT_DIR\" \"$TEMP_EXTRACT\" 2>/dev/null || true\n\n# ---- Step 4: XAPK extract karein ----\nif [[ \"$APK_FILE\" == *.xapk ]]; then\n    echo \"XAPK detected. Extracting base.apk...\"\n    unzip -o \"$APK_FILE\" -d \"$TEMP_EXTRACT\" > /dev/null 2>&1 || true\n    TARGET_APK=$(find \"$TEMP_EXTRACT\" -name \"base.apk\" | head -n 1)\n    [ -z \"$TARGET_APK\" ] && TARGET_APK=$(find \"$TEMP_EXTRACT\" -name \"*.apk\" | head -n 1)\n    if [ -z \"$TARGET_APK\" ]; then\n        echo \"ERROR: No APK found inside XAPK\"; exit 1\n    fi\n    echo \"Extracted: $TARGET_APK\"\n    cp \"$TARGET_APK\" \"$BASE_DIR/current_target.apk\"\nelse\n    cp \"$APK_FILE\" \"$BASE_DIR/current_target.apk\"\nfi\nchmod 666 \"$BASE_DIR/current_target.apk\" 2>/dev/null || true\n\n# ---- Step 5: JADX decompile ----\necho \"Starting JADX: $(basename \"$APK_FILE\")\"\ndocker run --rm \\\n  -v \"$BASE_DIR\":/workspace \\\n  abh1sek/jadx \\\n  jadx \\\n  -d /workspace/report \\\n  --no-res \\\n  /workspace/current_target.apk || echo \"JADX minor errors, continuing...\"\n\n# ---- Step 6: Cleanup ----\nrm -f \"$BASE_DIR/current_target.apk\"\n\n# ---- Step 7: Success check ----\nFILE_COUNT=$(find \"$REPORT_DIR\" -type f 2>/dev/null | wc -l)\nSOURCE_COUNT=$(find \"$REPORT_DIR/sources\" -type f 2>/dev/null | wc -l)\necho \"Report files: $FILE_COUNT (sources: $SOURCE_COUNT)\"\n\nif [ \"$FILE_COUNT\" -gt 10 ] || [ \"$SOURCE_COUNT\" -gt 0 ]; then\n    echo \"SUCCESS: JADX decompilation complete.\"\nelse\n    echo \"CRITICAL: Decompilation failed!\"; exit 1\nfi"
+      },
+      "id": "d57874b5-e3bf-4639-a499-83f618634864",
+      "name": "Execute Command - JADX Analyze",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        592,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "command": "#!/bin/bash\n# ============================================================\n#  Keenu InfoSec — APK Secrets Static Analysis\n#  Architecture: single-pass read → per-pattern grep on flat file\n#  BUG FIX: pattern FILE approach removed — heredoc backslash\n#  escaping breaks grep -E -f. All patterns now inline via -E.\n# ============================================================\n\nREPORT_DIR=\"/tmp/apk_analysis_keenu/report\"\nOUTPUT=\"/tmp/apk_analysis_keenu/secrets_report.html\"\nSCAN_DATE=$(date \"+%B %d, %Y — %H:%M:%S\")\nFILE_COUNT=$(find \"$REPORT_DIR\" -type f 2>/dev/null | wc -l)\n\nWORK_DIR=\"/tmp/apk_analysis_keenu/_scan_work\"\nmkdir -p \"$WORK_DIR\"\n\nALL_MATCHES=\"$WORK_DIR/all_matches.txt\"\nFINDINGS_TMP=\"$WORK_DIR/findings.tmp\"\n\n> \"$ALL_MATCHES\"\n> \"$FINDINGS_TMP\"\n\nFOUND_COUNT=0\nCLEAN_COUNT=0\n\n# ============================================================\n#  STEP 1: Single-pass read of all files → flat match list\n#  Broad catch-all regex pulls any line worth checking.\n#  Per-pattern filtering happens in STEP 2 (in-memory only).\n# ============================================================\ngrep -r -i -E \\\n  '(key|secret|pass|token|auth|api|cred|hash|salt|cipher|encrypt|jwt|bearer|private|merchant|terminal|pin|akia|AIza|eyJ|sk_live|pk_live|xox|firebase|jdbc|mysql|mongodb|postgresql|redis|jazzcash|easypaisa|hbl|meezan|ubl|1link|raast|ibft|exported|allowBackup|debuggable|Log[.]d|MessageDigest|AES/|DES|MD5|SHA1|SecretKeySpec|addPin|sha256/)' \\\n  \"$REPORT_DIR\" 2>/dev/null \\\n  | grep -v \"public[.]xml\" \\\n  | grep -v \"R[.]java\" \\\n  | grep -v \"android/support\" \\\n  | grep -v \"androidx\" \\\n  | grep -v \"google/android/gms\" \\\n  | grep -v \"com/facebook/\" \\\n  | grep -v \"com/google/android\" \\\n  | grep -v \"okhttp3/\" \\\n  | grep -v \"retrofit2/\" \\\n  | grep -v \"com/squareup/\" \\\n  | grep -v \"io/fabric/\" \\\n  | grep -v \"com/crashlytics/\" \\\n  | grep -v \"org/bouncycastle/\" \\\n  | grep -v \"com/amazonaws/util\\|com/amazonaws/internal\\|com/amazonaws/http\" \\\n  | sed \"s|${REPORT_DIR}/||g\" \\\n  > \"$ALL_MATCHES\"\n\nTOTAL_LINES=$(wc -l < \"$ALL_MATCHES\")\necho \"Single-pass complete: $TOTAL_LINES raw lines captured\"\n\n# ============================================================\n#  scan_pattern: grep all_matches.txt with inline -E pattern\n#  No file I/O after this point — pure in-memory grep\n# ============================================================\nscan_pattern() {\n    local TITLE=\"$1\"\n    local REGEX=\"$2\"\n    local CATEGORY=\"${3:-General}\"\n\n    local RESULT\n    RESULT=$(grep -i -E \"$REGEX\" \"$ALL_MATCHES\" 2>/dev/null | head -n 20)\n\n    if [ -z \"$RESULT\" ]; then\n        CLEAN_COUNT=$((CLEAN_COUNT + 1))\n        {\n          printf '<div class=\"finding-card clean\">\\n'\n          printf '  <div class=\"finding-header\">\\n'\n          printf '    <div class=\"finding-left\">\\n'\n          printf '      <span class=\"finding-icon clean-icon\">&#10003;</span>\\n'\n          printf '      <div>\\n'\n          printf '        <div class=\"finding-title\">%s</div>\\n' \"$TITLE\"\n          printf '        <div class=\"finding-cat\">%s</div>\\n' \"$CATEGORY\"\n          printf '      </div>\\n    </div>\\n'\n          printf '    <span class=\"badge badge-clean\">CLEAN</span>\\n'\n          printf '  </div>\\n'\n          printf '  <div class=\"finding-body clean-body\">No matches found in decompiled source.</div>\\n'\n          printf '</div>\\n'\n        } >> \"$FINDINGS_TMP\"\n    else\n        FOUND_COUNT=$((FOUND_COUNT + 1))\n        local ESCAPED\n        ESCAPED=$(printf '%s' \"$RESULT\" \\\n            | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')\n        {\n          printf '<div class=\"finding-card found\">\\n'\n          printf '  <div class=\"finding-header\">\\n'\n          printf '    <div class=\"finding-left\">\\n'\n          printf '      <span class=\"finding-icon found-icon\">!</span>\\n'\n          printf '      <div>\\n'\n          printf '        <div class=\"finding-title\">%s</div>\\n' \"$TITLE\"\n          printf '        <div class=\"finding-cat\">%s</div>\\n' \"$CATEGORY\"\n          printf '      </div>\\n    </div>\\n'\n          printf '    <span class=\"badge badge-found\">EXPOSED</span>\\n'\n          printf '  </div>\\n'\n          printf '  <div class=\"finding-body\">\\n'\n          printf '    <div class=\"code-label\">&#9658; Matches found</div>\\n'\n          printf '    <pre class=\"code-block\">%s</pre>\\n' \"$ESCAPED\"\n          printf '  </div>\\n</div>\\n'\n        } >> \"$FINDINGS_TMP\"\n    fi\n}\n\n# ============================================================\n#  STEP 2: Per-pattern matching (all inline -E, no file)\n# ============================================================\n\n# Cloud Credentials\nscan_pattern \"AWS Access Keys\"                  'AKIA[0-9A-Z]{16,20}'                                                                                                      \"Cloud Credentials\"\nscan_pattern \"Google API Keys\"                  'AIza[0-9A-Za-z_-]{30,}'                                                                                                   \"Cloud Credentials\"\nscan_pattern \"Google OAuth Tokens\"              '[0-9]+-[0-9A-Za-z_]{32}[.]apps[.]googleusercontent[.]com'                                                                 \"OAuth / SSO\"\nscan_pattern \"Firebase URLs\"                    'https://[a-z0-9-]+[.]firebaseio[.]com'                                                                                     \"Firebase / GCP\"\n\n# Authentication\nscan_pattern \"JWT / Bearer Tokens\"              '(Bearer[[:space:]]+[a-zA-Z0-9._~+/=-]{20,}|eyJ[a-zA-Z0-9_-]{10,}[.][a-zA-Z0-9_-]{10,}[.][a-zA-Z0-9_-]{10,})'            \"Authentication\"\nscan_pattern \"Facebook Access Tokens\"           'EAACEdEose0cBA[0-9A-Za-z]+'                                                                                                \"Social / OAuth\"\n\n# Cryptographic Secrets\nscan_pattern \"Private Keys (RSA/DSA/PEM)\"       '-----BEGIN.{0,20}PRIVATE KEY-----'                                                                                        \"Cryptographic Secrets\"\nscan_pattern \"SSH Private Keys\"                 '-----BEGIN OPENSSH PRIVATE KEY-----'                                                                                       \"Cryptographic Secrets\"\nscan_pattern \"Hardcoded Encryption Keys\"        'SecretKeySpec[^\"'\"'\"']{0,30}[\"'\"'\"'][a-zA-Z0-9@#$%^&+=]{8,}[\"'\"'\"']'                                                      \"Cryptographic Secrets\"\nscan_pattern \"SSL / Certificate Pins\"           '(sha256/|pin-sha256=|addPin\\()[^\"'\"'\"']{0,10}[\"'\"'\"'][A-Za-z0-9+/=]{40,}[\"'\"'\"']'                                          \"Network Security\"\n\n# Payment APIs\nscan_pattern \"Stripe API Keys\"                  '(sk_live_|pk_live_)[0-9a-zA-Z]{24,}'                                                                                      \"Payment APIs\"\n\n# Database\nscan_pattern \"Database Connection Strings\"      '(mongodb|mysql|postgresql|jdbc|redis)://[^[:space:]]{5,}@'                                                                 \"Database\"\n\n# Collaboration\nscan_pattern \"Slack Tokens\"                     'xox[pboa]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32}'                                                                    \"Collaboration\"\nscan_pattern \"Heroku API Key\"                   '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'                                             \"Cloud Credentials\"\n\n# General Secrets\nscan_pattern \"Hardcoded Passwords / Secrets\"    '(password|passwd|secret|api_key|access_token|auth_token)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=_-]{8,}[\"'\"'\"']?'   \"General Secrets\"\nscan_pattern \"Variable Assignment Secrets\"      '(\\bkey\\b|\\bsecret\\b|\\bpass\\b|\\btoken\\b)[[:space:]]*=[[:space:]]*\"[^\"]{8,}\"'                                                \"General Secrets\"\nscan_pattern \"High-Entropy Quoted Strings\"      '\"[a-zA-Z0-9/+=]{20,}\"'                                                                                                     \"Encoded Secrets\"\nscan_pattern \"Base64 Encoded Secrets\"           '(api_key|secret|token|password|auth_token)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[A-Za-z0-9+/]{32,}={0,2}[\"'\"'\"']?'        \"Encoded Secrets\"\nscan_pattern \"Long High-Entropy Strings (40+)\"  '[a-zA-Z0-9+/]{40,}={0,2}'                                                                                                  \"Encoded Secrets\"\n\n# Android Specific\nscan_pattern \"BuildConfig Sensitive Fields\"     'BuildConfig[.](API_KEY|SECRET|TOKEN|PASSWORD|KEY|HASH|SALT|CLIENT_ID|CLIENT_SECRET)'                                       \"Build Config\"\nscan_pattern \"strings.xml Sensitive Values\"     '<string name=\"(api_key|secret|token|password|auth|client_id|client_secret|private_key)[^\"]*\">[^<]{8,}</string>'           \"Android Resources\"\n\n# AndroidManifest Security Flags\nscan_pattern \"Manifest: Exported Components\"    'android:exported=\"true\"'                                                                                                   \"AndroidManifest\"\nscan_pattern \"Manifest: Backup Enabled\"         'android:allowBackup=\"true\"'                                                                                                \"AndroidManifest\"\nscan_pattern \"Manifest: Debuggable Flag\"        'android:debuggable=\"true\"'                                                                                                 \"AndroidManifest\"\n\n# Weak Cryptography\nscan_pattern \"Weak Cipher Mode (AES/CBC, ECB)\"  'AES/CBC/PKCS5Padding|AES/ECB'                                                                                             \"Weak Cryptography\"\nscan_pattern \"Weak Hash (MD5 / SHA1)\"           'MessageDigest[.]getInstance\\(\"(MD5|SHA1)\"\\)'                                                                               \"Weak Cryptography\"\n\n# Log / Debug Leaks\nscan_pattern \"Sensitive Data in Logs\"           'Log[.][dve]\\([^)]{0,80}(token|key|secret|pass|auth|user|email|card|pin|cvv)[^)]{0,80}\\)'                                  \"Debug / Log Leaks\"\n\n# Information Disclosure\nscan_pattern \"Email Addresses\"                  '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+[.][a-zA-Z]{2,6}'                                                                        \"Information Disclosure\"\nscan_pattern \"Internal IP Addresses\"            '(192[.]168[.]|10[.]|172[.](1[6-9]|2[0-9]|3[01]))[0-9]{1,3}[.][0-9]{1,3}'                                                 \"Network Exposure\"\n\n# Keenu / Fintech Pakistan\nscan_pattern \"JazzCash Credentials\"             '(jazzcash|jazz_cash|jc_merchant|jc_password|jc_salt|jc_hash_key)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=_-]{8,}[\"'\"'\"']?'    \"Payment APIs — PK\"\nscan_pattern \"EasyPaisa / Telenor Keys\"         '(easypaisa|easy_paisa|ep_merchant|ep_token|ep_password|telenor_key)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=_-]{8,}[\"'\"'\"']?'  \"Payment APIs — PK\"\nscan_pattern \"HBL / Bank API Credentials\"       '(hbl_key|hbl_secret|meezan_|ubl_key|bank_secret|bank_token|bank_api)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=_-]{8,}[\"'\"'\"']?'  \"Payment APIs — PK\"\nscan_pattern \"1Link / IBFT / Raast Keys\"        '(1link|onelink|ibft[^a-zA-Z]|raast)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=_-]{8,}[\"'\"'\"']?'                                    \"Payment APIs — PK\"\nscan_pattern \"POS Terminal / Merchant Secrets\"  '(terminal_id|merchant_id|merchant_key|pos_key)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9@#$%^&+=]{8,}[\"'\"'\"']?'                           \"POS / Merchant\"\nscan_pattern \"Encryption / PINBlock Keys\"       '(pin_key|pinblock|des_key|3des_key|tdes_key|master_key|session_key)[^=:\\n]{0,20}[=:][[:space:]]*[\"'\"'\"']?[a-zA-Z0-9]{16,}[\"'\"'\"']?'             \"Cryptographic Secrets\"\n\nTOTAL_COUNT=$((FOUND_COUNT + CLEAN_COUNT))\necho \"Pattern matching complete: $FOUND_COUNT exposed, $CLEAN_COUNT clean\"\n\n# ============================================================\n#  STEP 3: Build HTML report\n# ============================================================\ncat > \"$OUTPUT\" << 'HTMLEOF'\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\"/>\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"/>\n<title>Keenu InfoSec — APK Secrets Report</title>\n<link href=\"https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@300;400;500&display=swap\" rel=\"stylesheet\"/>\n<style>\n:root {\n  --bg:#ffffff;--surface:#f4f6f9;--surface2:#eaecf2;--border:#d4d8e2;\n  --accent:#008f6b;--accent2:#006e52;--red:#d93025;--orange:#e05a1f;\n  --text:#0f1117;--muted:#5a6380;\n}\n*{margin:0;padding:0;box-sizing:border-box;}\nhtml{-webkit-print-color-adjust:exact;print-color-adjust:exact;}\nbody{background:var(--bg);color:var(--text);font-family:'Outfit',sans-serif;font-size:13px;line-height:1.6;}\n.cover{min-height:100vh;display:flex;flex-direction:column;justify-content:space-between;padding:56px 64px 48px;background:var(--bg);position:relative;overflow:hidden;page-break-after:always;}\n.cover::before{content:'';position:absolute;top:-200px;right:-200px;width:700px;height:700px;border-radius:50%;background:radial-gradient(circle,rgba(0,143,107,0.07) 0%,transparent 65%);pointer-events:none;}\n.cover::after{content:'';position:absolute;bottom:-100px;left:-100px;width:500px;height:500px;border-radius:50%;background:radial-gradient(circle,rgba(217,48,37,0.05) 0%,transparent 65%);pointer-events:none;}\n.cover-topbar{display:flex;justify-content:space-between;align-items:flex-start;position:relative;z-index:2;}\n.brand-name{font-family:'Syne',sans-serif;font-weight:800;font-size:20px;letter-spacing:0.1em;text-transform:uppercase;color:var(--text);}\n.brand-team{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--accent);letter-spacing:0.15em;text-transform:uppercase;margin-top:4px;}\n.tlp-badge{background:rgba(217,48,37,0.08);border:1px solid rgba(217,48,37,0.25);color:var(--red);font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.18em;text-transform:uppercase;padding:5px 14px;border-radius:4px;}\n.cover-mid{padding:70px 0 0;position:relative;z-index:2;}\n.cover-eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--accent);letter-spacing:0.2em;text-transform:uppercase;margin-bottom:18px;}\n.cover-title{font-family:'Syne',sans-serif;font-size:54px;font-weight:800;line-height:1.0;color:var(--text);max-width:680px;}\n.cover-title .hl{color:var(--accent);}\n.cover-sub{margin-top:20px;font-size:14px;color:var(--muted);max-width:520px;font-weight:300;}\n.cover-rule{width:56px;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:2px;margin:28px 0 36px;}\n.cover-meta-row{display:grid;grid-template-columns:repeat(2,1fr);gap:24px;padding:28px;background:var(--surface);border:1px solid var(--border);border-radius:8px;}\n.cmeta-item{display:flex;flex-direction:column;gap:5px;}\n.cmeta-label{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:0.12em;text-transform:uppercase;}\n.cmeta-value{font-family:'Syne',sans-serif;font-size:13px;font-weight:600;color:var(--text);}\n.cover-bottom{position:relative;z-index:2;border-top:1px solid var(--border);padding-top:28px;display:flex;justify-content:space-between;align-items:flex-end;}\n.warn-incomplete{background:rgba(224,90,31,0.08);border:1px solid rgba(224,90,31,0.3);color:var(--orange);font-family:'IBM Plex Mono',monospace;font-size:11px;padding:10px 16px;border-radius:6px;margin-bottom:24px;}\n.content{max-width:960px;margin:0 auto;padding:60px 40px 80px;}\n.sec-header{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:14px;border-bottom:1px solid var(--border);}\n.sec-num{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--accent);background:rgba(0,143,107,0.08);border:1px solid rgba(0,143,107,0.2);padding:4px 10px;border-radius:4px;letter-spacing:0.08em;}\n.sec-title{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--text);}\n.hr{border:none;border-top:1px solid var(--border);margin:40px 0;}\n.stats-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:36px;}\n.stat-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:22px 18px;text-align:center;}\n.stat-box-n{font-family:'Syne',sans-serif;font-size:34px;font-weight:800;line-height:1;margin-bottom:6px;}\n.stat-box-lbl{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;}\n.stat-box.r .stat-box-n{color:var(--red);}\n.stat-box.g .stat-box-n{color:var(--accent);}\n.stat-box.w .stat-box-n{color:var(--text);}\n.finding-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden;}\n.finding-card.found{border-left:3px solid var(--red);}\n.finding-card.clean{border-left:3px solid var(--accent);}\n.finding-header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;background:var(--surface2);}\n.finding-left{display:flex;align-items:center;gap:14px;}\n.finding-icon{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;}\n.found-icon{background:rgba(217,48,37,0.1);color:var(--red);}\n.clean-icon{background:rgba(0,143,107,0.1);color:var(--accent);}\n.finding-title{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;color:var(--text);}\n.finding-cat{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-top:2px;}\n.badge{font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:0.12em;text-transform:uppercase;padding:3px 10px;border-radius:4px;flex-shrink:0;}\n.badge-found{background:rgba(217,48,37,0.08);color:var(--red);border:1px solid rgba(217,48,37,0.25);}\n.badge-clean{background:rgba(0,143,107,0.08);color:var(--accent);border:1px solid rgba(0,143,107,0.2);}\n.finding-body{padding:12px 20px 16px;background:var(--bg);}\n.clean-body{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);font-style:italic;}\n.code-label{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:8px;}\n.code-block{background:#f0f4f8;border:1px solid var(--border);border-radius:6px;padding:14px 16px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#1a3a5c;line-height:1.65;white-space:pre-wrap;word-break:break-all;overflow-x:auto;max-height:220px;overflow-y:auto;}\n.report-footer{margin-top:60px;padding-top:20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}\n.footer-l{font-size:11px;color:var(--muted);}\n.footer-l strong{color:var(--text);}\n.footer-r{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);display:flex;align-items:center;gap:14px;}\n.conf-tag{background:rgba(217,48,37,0.07);border:1px solid rgba(217,48,37,0.2);color:var(--red);font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:0.15em;text-transform:uppercase;padding:3px 10px;border-radius:4px;}\n@media print{\n  body{background:#fff;color:#0f1117;}\n  .cover{background:#fff;min-height:auto;padding:40px;}\n  .code-block{background:#f0f4f8;color:#1a3a5c;border-color:#d4d8e2;}\n  .finding-card{background:#f4f6f9;border-color:#d4d8e2;}\n  .finding-header{background:#eaecf2;}\n  .finding-body{background:#fff;}\n}\n</style>\n</head>\n<body>\n<div class=\"cover\">\n  <div class=\"cover-topbar\">\n    <div>\n      <div class=\"brand-name\">Keenu</div>\n      <div class=\"brand-team\">Team InfoSec</div>\n    </div>\n    <div class=\"tlp-badge\">TLP:RED — Confidential</div>\n  </div>\n  <div class=\"cover-mid\">\n    <div class=\"cover-eyebrow\">Mobile Application Security — Static Analysis</div>\n    <div class=\"cover-title\">APK Secrets<br/><span class=\"hl\">Exposure Report</span></div>\n    <div class=\"cover-sub\">Automated static analysis of decompiled Android APK using JADX. Identifies hardcoded API keys, credentials, tokens, private keys, and sensitive configuration values embedded in application source code.</div>\n    <div class=\"cover-rule\"></div>\n    <div class=\"cover-meta-row\">\n      <div class=\"cmeta-item\"><span class=\"cmeta-label\">Organization</span><span class=\"cmeta-value\">Keenu</span></div>\n      <div class=\"cmeta-item\"><span class=\"cmeta-label\">Team</span><span class=\"cmeta-value\">InfoSec</span></div>\n      <div class=\"cmeta-item\"><span class=\"cmeta-label\">Scan Date</span><span class=\"cmeta-value\">SCAN_DATE_PLACEHOLDER</span></div>\n      <div class=\"cmeta-item\"><span class=\"cmeta-label\">Files Analyzed</span><span class=\"cmeta-value\">FILE_COUNT_PLACEHOLDER</span></div>\n    </div>\n  </div>\n  <div class=\"cover-bottom\">\n    <div style=\"font-family:'IBM Plex Mono',monospace;font-size:10px;color:#5a6380;\">Generated by Keenu InfoSec</div>\n    <div class=\"tlp-badge\" style=\"font-size:9px;\">Confidential</div>\n  </div>\n</div>\n<div class=\"content\">\nHTMLEOF\n\nif [ \"$FILE_COUNT\" -lt 50 ]; then\n    printf '<div class=\"warn-incomplete\">&#9888; Warning: JADX returned fewer files than expected (%s files). Scan coverage may be incomplete.</div>\\n' \"$FILE_COUNT\" >> \"$OUTPUT\"\nfi\n\nprintf '  <div class=\"sec-header\"><span class=\"sec-num\">01</span><h2 class=\"sec-title\">Scan Summary</h2></div>\\n' >> \"$OUTPUT\"\nprintf '  <div class=\"stats-strip\">\\n' >> \"$OUTPUT\"\nprintf '    <div class=\"stat-box r\"><div class=\"stat-box-n\">FOUND_COUNT_PLACEHOLDER</div><div class=\"stat-box-lbl\">Exposed Findings</div></div>\\n' >> \"$OUTPUT\"\nprintf '    <div class=\"stat-box g\"><div class=\"stat-box-n\">CLEAN_COUNT_PLACEHOLDER</div><div class=\"stat-box-lbl\">Clean Checks</div></div>\\n' >> \"$OUTPUT\"\nprintf '    <div class=\"stat-box w\"><div class=\"stat-box-n\">FILE_COUNT_PLACEHOLDER</div><div class=\"stat-box-lbl\">Files Scanned</div></div>\\n' >> \"$OUTPUT\"\nprintf '  </div>\\n  <hr class=\"hr\"/>\\n' >> \"$OUTPUT\"\nprintf '  <div class=\"sec-header\"><span class=\"sec-num\">02</span><h2 class=\"sec-title\">Detailed Findings</h2></div>\\n' >> \"$OUTPUT\"\nprintf '  <div id=\"findings-container\">\\n' >> \"$OUTPUT\"\n\ncat \"$FINDINGS_TMP\" >> \"$OUTPUT\"\n\nprintf '  </div>\\n  <hr class=\"hr\"/>\\n' >> \"$OUTPUT\"\nprintf '  <div class=\"report-footer\">\\n' >> \"$OUTPUT\"\nprintf '    <div class=\"footer-l\"><strong>Keenu &mdash; InfoSec Team</strong></div>\\n' >> \"$OUTPUT\"\nprintf '    <div class=\"footer-r\"><span class=\"conf-tag\">Confidential</span></div>\\n' >> \"$OUTPUT\"\nprintf '  </div>\\n</div>\\n</body>\\n</html>\\n' >> \"$OUTPUT\"\n\nsed -i \\\n  -e \"s/SCAN_DATE_PLACEHOLDER/${SCAN_DATE}/g\" \\\n  -e \"s/FILE_COUNT_PLACEHOLDER/${FILE_COUNT}/g\" \\\n  -e \"s/FOUND_COUNT_PLACEHOLDER/${FOUND_COUNT}/g\" \\\n  -e \"s/CLEAN_COUNT_PLACEHOLDER/${CLEAN_COUNT}/g\" \\\n  \"$OUTPUT\"\n\nchmod 644 \"$OUTPUT\"\nrm -rf \"$WORK_DIR\"\n\necho \"Report generated: $OUTPUT\"\necho \"Size  : $(wc -c < \"$OUTPUT\") bytes\"\necho \"Found : $FOUND_COUNT exposed\"\necho \"Clean : $CLEAN_COUNT clean\"\necho \"Files : $FILE_COUNT scanned\""
+      },
+      "id": "3ba93609-e2f4-4557-aa95-4ca851006507",
+      "name": "Execute Command - Extract Secrets",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        816,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "/tmp/apk_analysis_keenu/reports/latest_report.tar.gz"
+      },
+      "id": "11319dc3-1be0-4d47-951d-c3280084c7bb",
+      "name": "Read Binary File",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        1488,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=BASE='/tmp/apk_analysis_keenu'\nDEST_DIR=\"$BASE/reports\"\n\n# Package name\nif [ -f \"$BASE/drive_pkg_name.txt\" ]; then\n    PKG_NAME=$(cat \"$BASE/drive_pkg_name.txt\")\n    rm -f \"$BASE/drive_pkg_name.txt\"\nelse\n    FALLBACK=$(ls -t \"$BASE/apk\"/*.xapk \"$BASE/apk\"/*.apk 2>/dev/null | head -n 1)\n    PKG_NAME=$(basename \"${FALLBACK%.*}\" | sed 's/-[0-9].*//')\n    [ -z \"$PKG_NAME\" ] && PKG_NAME='unknown_app'\nfi\n\nTIMESTAMP=$(date +'%Y%m%d_%H%M%S')\nARCHIVE_NAME=\"${PKG_NAME}_${TIMESTAMP}.tar.gz\"\nFIXED_LINK=\"$BASE/reports/latest_report.tar.gz\"\n\n# Clean reports dir completely before packaging\ndocker run --rm -v \"$BASE\":/workspace alpine sh -c 'rm -rf /workspace/reports'\nmkdir -p \"$DEST_DIR\"\n\n# Copy PDFs\ncp \"$BASE/mobsf_report.pdf\"   \"$DEST_DIR/\" 2>/dev/null && echo 'MobSF PDF ok'   || echo 'MobSF PDF missing'\ncp \"$BASE/secrets_report.pdf\" \"$DEST_DIR/\" 2>/dev/null && echo 'Secrets PDF ok' || echo 'Secrets PDF missing'\n\ncd \"$DEST_DIR\"\n\nFILES=''\n[ -f 'mobsf_report.pdf'   ] && FILES=\"$FILES mobsf_report.pdf\"\n[ -f 'secrets_report.pdf' ] && FILES=\"$FILES secrets_report.pdf\"\n\nif [ -n \"$FILES\" ]; then\n    tar -czf \"$ARCHIVE_NAME\" $FILES\n    echo \"ARCHIVE_NAME=${ARCHIVE_NAME}\"\n    ln -sf \"$DEST_DIR/$ARCHIVE_NAME\" \"$FIXED_LINK\"\nelse\n    echo 'ERROR: No PDFs to package'; exit 1\nfi\n\n# Full cleanup — docker se taake root files bhi jaayein\ndocker run --rm -v \"$BASE\":/workspace alpine sh -c '\n  rm -f /workspace/secrets_found.txt\n  rm -f /workspace/secrets_report.pdf\n  rm -f /workspace/secrets_report.html\n  rm -f /workspace/mobsf_report.pdf\n  rm -f /workspace/mobsf_report.json\n  rm -f /workspace/mobsf_summary.txt\n  rm -f /workspace/pdf_payload.json\n  rm -f /workspace/current_scan.apk\n  rm -rf /workspace/report\n  rm -rf /workspace/temp_unzip\n  rm -rf /workspace/apk\n'\nmkdir -p \"$BASE/apk\"\necho 'Full cleanup done!'\n"
+      },
+      "id": "fd4c23e3-851c-423a-9e8f-bc750456877b",
+      "name": "Execute Command - Package Combined",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1264,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=APK_FILE=$(ls -t /tmp/apk_analysis_keenu/apk/*.xapk /tmp/apk_analysis_keenu/apk/*.apk 2>/dev/null | head -n 1)\n\nif [ -z \"$APK_FILE\" ]; then\n    echo \"ERROR: No APK found in /tmp/apk_analysis_keenu/apk/\"; exit 1\nfi\n\necho \"Scanning: $APK_FILE ($(du -h \"$APK_FILE\" | cut -f1))\"\n\nAPI_KEY=\"39763849070d97084e284a58bb18179e10e37ae2da4046437d816ce269c99d04\"\nMOBSF_URL=\"http://172.17.0.5:8000\"\n\necho \"Uploading to MobSF...\"\nUPLOAD=$(curl -s -F \"file=@$APK_FILE\" -H \"X-MobSF-API-Key:$API_KEY\" $MOBSF_URL/api/v1/upload)\nHASH=$(echo \"$UPLOAD\" | jq -r '.hash // empty')\n\nif [ -z \"$HASH\" ]; then\n    echo \"CRITICAL ERROR: Upload Failed. Response: $UPLOAD\"; exit 1\nfi\necho \"Upload Success! Hash: $HASH\"\n\ncurl -s -X POST -F \"hash=$HASH\" -H \"X-MobSF-API-Key:$API_KEY\" $MOBSF_URL/api/v1/scan >/dev/null\n\necho \"Waiting for scan...\"\nfor i in {1..120}; do\n    sleep 5\n    STATUS=$(curl -s -X POST -F \"hash=$HASH\" -H \"X-MobSF-API-Key:$API_KEY\" $MOBSF_URL/api/v1/report_json 2>/dev/null)\n    if echo \"$STATUS\" | jq -e '.file_name' > /dev/null 2>&1; then\n        echo \"Scan complete!\"; break\n    fi\n    [ $i -eq 120 ] && { echo \"Scan timed out\"; exit 1; }\n    echo \"Scanning... ($((i*5))s)\"\ndone\n\ncurl -s -X POST -F \"hash=$HASH\" -H \"X-MobSF-API-Key:$API_KEY\" $MOBSF_URL/api/v1/download_pdf -o /tmp/apk_analysis_keenu/mobsf_report.pdf\ncurl -s -X POST -F \"hash=$HASH\" -H \"X-MobSF-API-Key:$API_KEY\" $MOBSF_URL/api/v1/report_json -o /tmp/apk_analysis_keenu/mobsf_report.json\n\necho \"✓ MobSF Analysis Complete\" "
+      },
+      "id": "8da78aa5-3110-4a43-afbe-878fb40a6d07",
+      "name": "Execute Command - MobSF Scan",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        368,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=# Clean old APKs, download fresh\nrm -rf /tmp/apk_analysis_keenu/apk\nmkdir -p /tmp/apk_analysis_keenu/apk\n\ndocker run --rm -v /tmp/apk_analysis_keenu/apk:/app ghcr.io/efforg/apkeep:stable \\\n  -a \"{{ $('Edit Fields').item.json.package_name }}\" \\\n  -d apk-pure \\\n  /app\n\n# Normalize: copy downloaded file to known path\nDOWNLOADED=$(ls /tmp/apk_analysis_keenu/apk/*.xapk /tmp/apk_analysis_keenu/apk/*.apk 2>/dev/null | head -n 1)\nif [ -z \"$DOWNLOADED\" ]; then\n    echo \"ERROR: Download failed\"; exit 1\nfi\ncp \"$DOWNLOADED\" /tmp/apk_analysis_keenu/current_scan.apk\necho \"Normalized to: current_scan.apk\"\n\n# Save package name for Package node\necho \"{{ $('Edit Fields').item.json.package_name }}\" > /tmp/apk_analysis_keenu/drive_pkg_name.txt\n# Package name file mein save karo (Upload node ke liye)\necho \"{{ $('Edit Fields').item.json.package_name }}\" > /tmp/apk_analysis_keenu/drive_pkg_name.txt\necho \"Package name saved.\""
+      },
+      "id": "d20f7218-6350-430b-bafa-062e0388307b",
+      "name": "Execute Command - Download",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        144,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assignment1",
+              "name": "package_name",
+              "value": "com.wemsol.keenurewards",
+              "type": "string"
+            },
+            {
+              "id": "assignment2",
+              "name": "app_name",
+              "value": "Keenu",
+              "type": "string"
+            },
+            {
+              "id": "assignment3",
+              "name": "mobsf_api_key",
+              "value": "39763849070d97084e284a58bb18179e10e37ae2da4046437d816ce269c99d04",
+              "type": "string"
+            },
+            {
+              "id": "assignment4",
+              "name": "mobsf_url",
+              "value": "http://172.17.0.5:8000",
+              "type": "string"
+            },
+            {
+              "id": "assignment5",
+              "name": "drive_link",
+              "value": "https://drive.google.com/file/d/1Ix4WuX_ZL2Whm8mclJ2UMhU5D9nCpKuY/view?usp=drive_link",
+              "type": "string"
+            },
+            {
+              "id": "assignment6",
+              "name": "htmlpdf_api_key",
+              "value": "RURq7CKhBALPjKuTPOfiWOz886O2uW71oZr56J3Pzs1yLznWYbI1Pvwo3L1hWLTh",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "99a21a7c-0345-4ee2-9257-24bed45e8c3f",
+      "name": "Edit Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -976,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "name": "={{ $('Execute Command - Package Combined').item.json.stdout.match(/ARCHIVE_NAME=([^\\n]+)/)?.[1]?.trim() || ($('Edit Fields').item.json.package_name + '_' + $now.format('yyyyMMdd_HHmmss') + '.tar.gz') }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1VpgxK4O03Jrhr3DyBlLTL0jZD_avlYLG",
+          "mode": "list",
+          "cachedResultName": "AppSec Scans",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1VpgxK4O03Jrhr3DyBlLTL0jZD_avlYLG"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1712,
+        -128
+      ],
+      "id": "4b5238d0-329f-456e-8d80-3127945a46bb",
+      "name": "Upload file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "xtv8thuKqG76QQN1",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $('Edit Fields').item.json.drive_link }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "573c192f-dfe5-47cc-ab8a-20f4d16e8895",
+      "name": "Drive Link or APKeep?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -752,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Edit Fields').item.json.drive_link }}"
+        },
+        "options": {}
+      },
+      "id": "f5d73b0a-f588-4995-b8e4-7a19f0e2630f",
+      "name": "Download APK from Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -304,
+        -128
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "xtv8thuKqG76QQN1",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fileName": "/tmp/apk_analysis_keenu/apk/drive_upload.apk",
+        "options": {}
+      },
+      "id": "a6ac3daa-6ff3-42db-9942-54e8ff5c3994",
+      "name": "Save APK to Disk",
+      "type": "n8n-nodes-base.writeBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=FILENAME=\"{{ $binary.data.fileName }}\"\n# Extension remove karo (.apk, .xapk)\nPKG_NAME=\"${FILENAME%.*}\"\n# Agar naam mein version ho (e.g. ws.krlp-1.0.apk) toh sirf package part lo\nPKG_NAME=\"${PKG_NAME%%-*}\"\necho \"$PKG_NAME\" > /tmp/apk_analysis_keenu/drive_pkg_name.txt\necho \"Drive package name set: $PKG_NAME\""
+      },
+      "id": "3385ca2c-c50b-4368-a77c-cb0011178e0c",
+      "name": "Set Package Name from Drive",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        144,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "command": "rm -rf /tmp/apk_analysis_keenu/apk && mkdir -p /tmp/apk_analysis_keenu/apk && echo 'APK folder cleaned'"
+      },
+      "id": "e44ba9e0-85e5-42ab-af8e-3f66bd100bd5",
+      "name": "Cleanup APK Folder",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -528,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "command": "rm -rf /tmp/apk_analysis_keenu/apk && mkdir -p /tmp/apk_analysis_keenu/apk && echo 'APK folder cleaned'"
+      },
+      "id": "9d8ce9a4-a8f1-4bdf-aad6-056d304dd282",
+      "name": "Cleanup APK Folder1",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        64
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=BASE='/tmp/apk_analysis_keenu'\nSECRETS=\"$BASE/secrets_report.html\"\nPDF=\"$BASE/secrets_report.pdf\"\nAPI_KEY='{{ $(\"Edit Fields\").item.json.htmlpdf_api_key }}'\n\nif [ ! -f \"$SECRETS\" ]; then echo 'ERROR: secrets_report.html not found'; exit 1; fi\n\n# Delete old PDF first (root owned bhi ho toh docker se hatao)\ndocker run --rm -v \"$BASE\":/workspace alpine sh -c '\n  rm -f /workspace/secrets_report.pdf\n  rm -f /workspace/pdf_payload.json\n'\necho 'Old files cleaned'\n\n# HTML already ready — seedha jq mein feed karo\njq -Rs --arg key \"$API_KEY\" \\\n  '{html:., apiKey:$key, format:\"A4\", marginTop:10, marginBottom:10, marginLeft:10, marginRight:10}' \\\n  \"$SECRETS\" > \"$BASE/pdf_payload.json\"\n\ncurl -s -X POST \\\n  -H 'Content-Type: application/json' \\\n  -d @\"$BASE/pdf_payload.json\" \\\n  'https://api.html2pdf.app/v1/generate' \\\n  --output \"$PDF\"\n\n# Verify\nHEADER=$(head -c 4 \"$PDF\" 2>/dev/null)\nif [ \"$HEADER\" = '%PDF' ]; then\n    SIZE=$(du -h \"$PDF\" | cut -f1)\n    echo \"PDF ready: $SIZE\"\nelse\n    echo 'ERROR: API response:'\n    cat \"$PDF\"\n    exit 1\nfi"
+      },
+      "id": "c4782c60-8d30-4751-a1a1-438826cf4ca9",
+      "name": "Execute Command - Secrets to PDF",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        -32
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 11
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1232,
+        -32
+      ],
+      "id": "84e97fd9-7648-494b-b3ca-f7c1aeacb9b6",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "sendTo": "farhad.ahmed@keenu.pk",
+        "subject": "Security Scan",
+        "emailType": "text",
+        "message": "Please find the report attached.",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {}
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1712,
+        64
+      ],
+      "id": "9489ec00-4412-4d46-b506-b5d3a1f14f39",
+      "name": "Send a message",
+      "webhookId": "9d8416a0-9023-4634-9a2b-282577cd398c",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "nYtTqJpvcZCJXcSP",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Drive Link or APKeep?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive Link or APKeep?": {
+      "main": [
+        [
+          {
+            "node": "Cleanup APK Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cleanup APK Folder1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download APK from Drive": {
+      "main": [
+        [
+          {
+            "node": "Save APK to Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save APK to Disk": {
+      "main": [
+        [
+          {
+            "node": "Set Package Name from Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - Download": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - MobSF Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - MobSF Scan": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - JADX Analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - JADX Analyze": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - Extract Secrets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - Extract Secrets": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - Secrets to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - Package Combined": {
+      "main": [
+        [
+          {
+            "node": "Read Binary File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Binary File": {
+      "main": [
+        [
+          {
+            "node": "Upload file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Package Name from Drive": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - MobSF Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleanup APK Folder": {
+      "main": [
+        [
+          {
+            "node": "Download APK from Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleanup APK Folder1": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - Download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Command - Secrets to PDF": {
+      "main": [
+        [
+          {
+            "node": "Execute Command - Package Combined",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "timezone": "Asia/Karachi",
+    "saveExecutionProgress": true,
+    "timeSavedPerExecution": 10
+  },
+  "versionId": "90e2ff45-84fe-44e6-bf93-786fcd5e129b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "3127e0702a73301f3dd2c5019e9732e437e6d3bef84a4f13fdb7f52d826473ea"
+  },
+  "id": "sK485WsHysoE0qQy",
+  "tags": []
+}
